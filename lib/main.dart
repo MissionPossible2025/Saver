@@ -20,7 +20,7 @@ class MyApp extends StatelessWidget {
           brightness: Brightness.light,
         ),
         useMaterial3: true,
-        cardTheme: CardTheme(
+        cardTheme: CardThemeData(
           elevation: 2,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
@@ -33,7 +33,7 @@ class MyApp extends StatelessWidget {
           brightness: Brightness.dark,
         ),
         useMaterial3: true,
-        cardTheme: CardTheme(
+        cardTheme: CardThemeData(
           elevation: 2,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
@@ -58,14 +58,16 @@ class _StatusDownloaderScreenState extends State<StatusDownloaderScreen> {
   List<StatusItem> statusItems = [];
   bool isLoading = false;
   String? errorMessage;
+  bool hasPermission = false;
+  bool isCheckingPermission = true;
 
   @override
   void initState() {
     super.initState();
-    _loadStatusItems();
+    _initAndLoad();
   }
 
-  Future<void> _loadStatusItems() async {
+  Future<void> _initAndLoad() async {
     if (!Platform.isAndroid) {
       setState(() {
         errorMessage = 'This app is only available for Android';
@@ -79,7 +81,80 @@ class _StatusDownloaderScreenState extends State<StatusDownloaderScreen> {
     });
 
     try {
-      final List<dynamic> result = await platform.invokeMethod('getStatusItems');
+      final bool permission =
+          await platform.invokeMethod<bool>('hasPersistedPermission') ?? false;
+      setState(() {
+        hasPermission = permission;
+        isCheckingPermission = false;
+      });
+
+      if (permission) {
+        await _loadStatusItems();
+      }
+    } on PlatformException catch (e) {
+      setState(() {
+        errorMessage = e.message ?? 'Failed to check permission';
+        isCheckingPermission = false;
+        isLoading = false;
+      });
+    } catch (e) {
+      setState(() {
+        errorMessage = 'Error: $e';
+        isCheckingPermission = false;
+        isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _requestFolderAccess() async {
+    try {
+      final bool granted = await platform
+              .invokeMethod<bool>('requestStatusFolderAccess') ??
+          false;
+      if (!granted) {
+        return;
+      }
+
+      setState(() {
+        hasPermission = true;
+      });
+
+      await _loadStatusItems();
+    } on PlatformException catch (e) {
+      setState(() {
+        errorMessage = e.message ?? 'Failed to request folder access';
+      });
+    } catch (e) {
+      setState(() {
+        errorMessage = 'Error: $e';
+      });
+    }
+  }
+
+  Future<void> _loadStatusItems() async {
+    if (!Platform.isAndroid) {
+      setState(() {
+        errorMessage = 'This app is only available for Android';
+      });
+      return;
+    }
+
+    if (!hasPermission) {
+      // Permission flow UI will be shown in _buildBody.
+      setState(() {
+        isLoading = false;
+      });
+      return;
+    }
+
+    setState(() {
+      isLoading = true;
+      errorMessage = null;
+    });
+
+    try {
+      final List<dynamic> result =
+          await platform.invokeMethod('getStatusFiles');
       setState(() {
         statusItems = result.map((item) => StatusItem.fromMap(item)).toList();
         isLoading = false;
@@ -101,10 +176,10 @@ class _StatusDownloaderScreenState extends State<StatusDownloaderScreen> {
     try {
       final String result = await platform.invokeMethod(
         'downloadStatus',
-        {
-          'path': item.path,
+        <String, dynamic>{
+          'uri': item.uri,
           'name': item.name,
-          'type': item.type,
+          'mimeType': item.mimeType,
         },
       );
 
@@ -157,6 +232,50 @@ class _StatusDownloaderScreenState extends State<StatusDownloaderScreen> {
   }
 
   Widget _buildBody() {
+    if (isCheckingPermission) {
+      return const Center(
+        child: CircularProgressIndicator(),
+      );
+    }
+
+    if (!hasPermission) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.folder_open,
+                size: 64,
+                color: Theme.of(context).colorScheme.primary,
+              ),
+              const SizedBox(height: 16),
+              Text(
+                'Grant WhatsApp Status Access',
+                style: Theme.of(context).textTheme.titleLarge,
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Select the WhatsApp .Statuses folder to view and download statuses',
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+              ),
+              const SizedBox(height: 24),
+              FilledButton(
+                onPressed: _requestFolderAccess,
+                child: const Text('Select Folder'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     if (isLoading) {
       return const Center(
         child: CircularProgressIndicator(),
@@ -194,6 +313,7 @@ class _StatusDownloaderScreenState extends State<StatusDownloaderScreen> {
     }
 
     if (statusItems.isEmpty) {
+      // Permission granted but no files found.
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(24.0),
@@ -212,7 +332,7 @@ class _StatusDownloaderScreenState extends State<StatusDownloaderScreen> {
               ),
               const SizedBox(height: 8),
               Text(
-                'Make sure you have WhatsApp status items available',
+                'Open WhatsApp status, then tap Refresh',
                 textAlign: TextAlign.center,
                 style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                       color: Theme.of(context).colorScheme.onSurfaceVariant,
@@ -244,29 +364,31 @@ class _StatusDownloaderScreenState extends State<StatusDownloaderScreen> {
 }
 
 class StatusItem {
-  final String path;
   final String name;
-  final String type; // 'image' or 'video'
+  final String mimeType;
+  final String uri;
   final int size;
   final int lastModified;
 
   StatusItem({
-    required this.path,
     required this.name,
-    required this.type,
+    required this.mimeType,
+    required this.uri,
     required this.size,
     required this.lastModified,
   });
 
   factory StatusItem.fromMap(Map<dynamic, dynamic> map) {
     return StatusItem(
-      path: map['path'] as String,
       name: map['name'] as String,
-      type: map['type'] as String,
+      mimeType: map['mimeType'] as String,
+      uri: map['uri'] as String,
       size: map['size'] as int? ?? 0,
       lastModified: map['lastModified'] as int? ?? 0,
     );
   }
+
+  bool get isVideo => mimeType.startsWith('video/');
 }
 
 class StatusItemCard extends StatelessWidget {
@@ -281,7 +403,7 @@ class StatusItemCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final isVideo = item.type == 'video';
+    final isVideo = item.isVideo;
     final sizeInMB = (item.size / (1024 * 1024)).toStringAsFixed(2);
 
     return Card(

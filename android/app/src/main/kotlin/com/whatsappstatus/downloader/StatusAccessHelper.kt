@@ -1,53 +1,39 @@
 package com.whatsappstatus.downloader
 
-import android.content.ContentResolver
-import android.content.ContentUris
 import android.content.Context
-import android.database.Cursor
 import android.net.Uri
-import android.os.Build
-import android.os.Environment
-import android.provider.MediaStore
 import android.util.Log
-import java.io.File
+import androidx.documentfile.provider.DocumentFile
 
 object StatusAccessHelper {
     private const val TAG = "StatusAccessHelper"
-    
-    // WhatsApp status directory paths
-    private val STATUS_PATHS = listOf(
-        File(Environment.getExternalStorageDirectory(), "WhatsApp/Media/.Statuses"),
-        File(Environment.getExternalStorageDirectory(), "Android/media/com.whatsapp/WhatsApp/Media/.Statuses")
-    )
 
-    fun getStatusFiles(): List<StatusFileInfo> {
+    fun getStatusFiles(context: Context, treeUri: Uri): List<StatusFileInfo> {
         val statusFiles = mutableListOf<StatusFileInfo>()
 
-        for (statusPath in STATUS_PATHS) {
-            if (statusPath.exists() && statusPath.isDirectory) {
-                try {
-                    val files = statusPath.listFiles()
-                    files?.forEach { file ->
-                        if (file.isFile && isValidStatusFile(file)) {
-                            val type = getFileType(file.name)
-                            statusFiles.add(
-                                StatusFileInfo(
-                                    path = file.absolutePath,
-                                    name = file.name,
-                                    type = type,
-                                    size = file.length(),
-                                    lastModified = file.lastModified(),
-                                    uri = null
-                                )
-                            )
-                        }
-                    }
-                } catch (e: SecurityException) {
-                    Log.e(TAG, "Security exception accessing ${statusPath.absolutePath}", e)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error accessing ${statusPath.absolutePath}", e)
+        try {
+            val root = DocumentFile.fromTreeUri(context, treeUri)
+                ?: return emptyList()
+
+            root.listFiles().forEach { docFile ->
+                if (docFile.isFile && isValidStatusFile(docFile)) {
+                    val name = docFile.name ?: "status"
+                    val mimeType = docFile.type ?: getMimeTypeFromName(name)
+                    statusFiles.add(
+                        StatusFileInfo(
+                            uri = docFile.uri,
+                            name = name,
+                            mimeType = mimeType,
+                            size = docFile.length(),
+                            lastModified = docFile.lastModified()
+                        )
+                    )
                 }
             }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Security exception accessing status folder", e)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error accessing status folder", e)
         }
 
         // Sort by last modified (newest first)
@@ -56,8 +42,13 @@ object StatusAccessHelper {
         return statusFiles
     }
 
-    private fun isValidStatusFile(file: File): Boolean {
-        val name = file.name.lowercase()
+    private fun isValidStatusFile(file: DocumentFile): Boolean {
+        val mime = file.type ?: ""
+        if (mime.startsWith("image/") || mime.startsWith("video/")) {
+            return true
+        }
+
+        val name = file.name?.lowercase() ?: return false
         return name.endsWith(".jpg") ||
                 name.endsWith(".jpeg") ||
                 name.endsWith(".png") ||
@@ -65,15 +56,7 @@ object StatusAccessHelper {
                 name.endsWith(".gif")
     }
 
-    private fun getFileType(fileName: String): String {
-        val name = fileName.lowercase()
-        return when {
-            name.endsWith(".mp4") -> "video"
-            else -> "image"
-        }
-    }
-
-    fun getMimeType(fileName: String): String {
+    private fun getMimeTypeFromName(fileName: String): String {
         val name = fileName.lowercase()
         return when {
             name.endsWith(".jpg") || name.endsWith(".jpeg") -> "image/jpeg"
@@ -86,12 +69,11 @@ object StatusAccessHelper {
 }
 
 data class StatusFileInfo(
-    val path: String,
     val name: String,
-    val type: String,
+    val mimeType: String,
     val size: Long,
     val lastModified: Long,
-    val uri: Uri?
+    val uri: Uri
 )
 
 

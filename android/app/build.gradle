@@ -24,8 +24,8 @@ if (flutterVersionName == null) {
 
 android {
     namespace "com.whatsappstatus.downloader"
-    compileSdk 34
-    ndkVersion flutter.ndkVersion
+    compileSdk 36
+    
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8
@@ -42,7 +42,7 @@ android {
 
     defaultConfig {
         applicationId "com.whatsappstatus.downloader"
-        minSdk 21
+        minSdkVersion flutter.minSdkVersion
         targetSdk 34
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
@@ -59,6 +59,9 @@ flutter {
     source '../..'
 }
 
-dependencies {}
+dependencies {
+    implementation "androidx.documentfile:documentfile:1.0.1"
+    implementation "androidx.activity:activity-ktx:1.8.2"
+}
 
 
