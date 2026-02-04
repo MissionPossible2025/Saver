@@ -6,6 +6,7 @@ import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
+import android.provider.DocumentsContract
 import android.util.Log
 import androidx.annotation.NonNull
 import androidx.documentfile.provider.DocumentFile
@@ -14,18 +15,36 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.ByteArrayOutputStream
 
 class MainActivity: FlutterActivity() {
     private val CHANNEL = "com.whatsappstatus.downloader/channel"
     private val TAG = "StatusDownloader"
     private val PREFS_NAME = "status_downloader_prefs"
     private val KEY_TREE_URI = "tree_uri"
+    private val KEY_APP_VERSION = "app_version"
     private val REQUEST_CODE_FOLDER_ACCESS = 1001
     
     private var folderAccessResult: MethodChannel.Result? = null
     
     private val prefs: SharedPreferences by lazy {
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+    }
+    
+    private fun getAppVersion(): Int {
+        return try {
+            val packageInfo = packageManager.getPackageInfo(packageName, 0)
+            // Use longVersionCode for API 28+, fallback to versionCode for older versions
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                packageInfo.longVersionCode.toInt()
+            } else {
+                @Suppress("DEPRECATION")
+                packageInfo.versionCode
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting app version", e)
+            0
+        }
     }
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
@@ -55,13 +74,88 @@ class MainActivity: FlutterActivity() {
                     }
                 }
                 "hasPersistedPermission" -> {
+                    val currentVersion = getAppVersion()
+                    val savedVersion = prefs.getInt(KEY_APP_VERSION, -1)
+                    
+                    // If version doesn't match, this is a fresh install - clear everything
+                    if (savedVersion != currentVersion) {
+                        Log.d(TAG, "App version changed or fresh install - clearing permissions")
+                        prefs.edit().clear().apply()
+                        result.success(false)
+                        return@setMethodCallHandler
+                    }
+                    
                     val treeUriString = prefs.getString(KEY_TREE_URI, null)
-                    result.success(treeUriString != null)
+                    if (treeUriString == null) {
+                        result.success(false)
+                        return@setMethodCallHandler
+                    }
+                    
+                    // Verify the permission is actually still valid
+                    // After uninstall/reinstall, the URI might exist but permission is lost
+                    try {
+                        val treeUri = Uri.parse(treeUriString)
+                        val persistedUriPermissions = contentResolver.persistedUriPermissions
+                        val hasValidPermission = persistedUriPermissions.any { 
+                            it.uri == treeUri && it.isReadPermission 
+                        }
+                        
+                        // Also verify we can actually access the folder
+                        if (hasValidPermission) {
+                            val documentFile = DocumentFile.fromTreeUri(applicationContext, treeUri)
+                            if (documentFile != null && documentFile.exists()) {
+                                result.success(true)
+                            } else {
+                                // Permission exists but folder is not accessible - clear it
+                                Log.d(TAG, "Permission exists but folder not accessible - clearing")
+                                prefs.edit().remove(KEY_TREE_URI).apply()
+                                result.success(false)
+                            }
+                        } else {
+                            // Permission was revoked or app was reinstalled - clear it
+                            Log.d(TAG, "Permission not found in system - clearing")
+                            prefs.edit().remove(KEY_TREE_URI).apply()
+                            result.success(false)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error checking permission validity", e)
+                        // Clear invalid permission
+                        prefs.edit().remove(KEY_TREE_URI).apply()
+                        result.success(false)
+                    }
                 }
                 "requestStatusFolderAccess" -> {
                     folderAccessResult = result
                     val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+                    // Force the picker to start at a neutral location instead of re-opening
+                    // the previously used folder from system memory.
+                    // This makes the experience match a first-time launch on reinstall.
+                    try {
+                        val initialUri = Uri.parse("content://com.android.externalstorage.documents/root/primary")
+                        intent.putExtra(DocumentsContract.EXTRA_INITIAL_URI, initialUri)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to set initial picker location", e)
+                    }
                     startActivityForResult(intent, REQUEST_CODE_FOLDER_ACCESS)
+                }
+                "readFileBytes" -> {
+                    try {
+                        val uriString = call.argument<String>("uri") ?: ""
+                        val uri = Uri.parse(uriString)
+                        val inputStream: InputStream? = contentResolver.openInputStream(uri)
+                        if (inputStream == null) {
+                            result.error("ERROR", "Failed to open file", null)
+                            return@setMethodCallHandler
+                        }
+                        val outputStream = ByteArrayOutputStream()
+                        inputStream.use { input ->
+                            input.copyTo(outputStream)
+                        }
+                        result.success(outputStream.toByteArray())
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error reading file bytes", e)
+                        result.error("ERROR", "Failed to read file: ${e.message}", null)
+                    }
                 }
                 else -> {
                     result.notImplemented()
@@ -80,15 +174,30 @@ class MainActivity: FlutterActivity() {
             if (resultCode == RESULT_OK && data != null) {
                 val treeUri = data.data
                 if (treeUri != null) {
-                    // Take persistent permission
-                    contentResolver.takePersistableUriPermission(
-                        treeUri,
-                        Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    )
-                    
-                    // Save the URI
-                    prefs.edit().putString(KEY_TREE_URI, treeUri.toString()).apply()
-                    result?.success(true)
+                    try {
+                        // Take persistent permission (lightweight operation)
+                        // This must be done synchronously while we have the result
+                        contentResolver.takePersistableUriPermission(
+                            treeUri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        )
+                        
+                        // Save the URI and app version (lightweight operation)
+                        // Use commit() instead of apply() to ensure it's saved immediately
+                        val currentVersion = getAppVersion()
+                        prefs.edit()
+                            .putString(KEY_TREE_URI, treeUri.toString())
+                            .putInt(KEY_APP_VERSION, currentVersion)
+                            .commit()
+                        
+                        // Return success immediately - let Flutter handle timing
+                        // Do NOT perform ANY file operations here - it will crash during Activity recreation
+                        // Flutter will handle file scanning after app lifecycle resumes
+                        result?.success(true)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error handling SAF result", e)
+                        result?.error("ERROR", "Failed to save permission: ${e.message}", null)
+                    }
                 } else {
                     result?.success(false)
                 }

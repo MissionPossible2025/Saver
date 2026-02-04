@@ -2,7 +2,7 @@
     package="com.whatsappstatus.downloader">
     
     <application
-        android:label="WhatsApp Status Downloader"
+        android:label="Status Saver"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         
