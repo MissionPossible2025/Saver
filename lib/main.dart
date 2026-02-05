@@ -236,17 +236,80 @@ class _StatusDownloaderScreenState extends State<StatusDownloaderScreen> {
       
       if (!mounted) return;
       
-      // Update state with results
+      // Update state with results immediately (show placeholders)
       if (mounted) {
         setState(() {
           statusItems = parsedItems;
           isLoading = false;
         });
+
+        // Inform Android that a refresh occurred so it can defer new thumbnail jobs by 300ms.
+        // This uses Handler(Looper.getMainLooper()).postDelayed(...) on the native side.
+        platform.invokeMethod('notifyRefresh').catchError((_) {});
       }
     } on PlatformException catch (e) {
+      final msg = e.message ?? 'Failed to load status items';
+
+      // Special handling for wrong-folder selection coming from Android
+      if (msg.contains('SELECT_WHATSAPP_STATUSES_FOLDER:')) {
+        if (!mounted) return;
+
+        final String? action = await showDialog<String>(
+          context: context,
+          barrierDismissible: false,
+          builder: (context) {
+            return AlertDialog(
+              titlePadding: const EdgeInsets.fromLTRB(24, 20, 8, 0),
+              title: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Expanded(
+                    child: Text('Choose WhatsApp statuses folder'),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close),
+                    tooltip: 'Close',
+                    onPressed: () => Navigator.of(context).pop('close'),
+                  ),
+                ],
+              ),
+              content: const Text(
+                'The folder you selected cannot show WhatsApp viewed statuses.\n\n'
+                'Please navigate to:\n'
+                'Android → media → com.whatsapp → WhatsApp → Media → .Statuses\n\n'
+                'Do not create a new folder, and ignore any “Can’t use this folder” message on intermediate folders. '
+                'Keep going until you reach the .Statuses folder, then tap “Use this folder”.',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop('retry'),
+                  child: const Text('Retry'),
+                ),
+              ],
+            );
+          },
+        );
+
+        if (!mounted) return;
+
+        // Reset state
+        setState(() {
+          hasPermission = false;
+          isLoading = false;
+          errorMessage = null;
+          statusItems = [];
+        });
+
+        // If user tapped Retry, open the instruction screen again so they can reselect.
+        if (action == 'retry') {
+          await _openFolderInstructions();
+        }
+        return;
+      }
+
       if (mounted) {
         setState(() {
-          errorMessage = e.message ?? 'Failed to load status items';
+          errorMessage = msg;
           isLoading = false;
         });
       }
@@ -466,7 +529,9 @@ class _StatusDownloaderScreenState extends State<StatusDownloaderScreen> {
                       cacheExtent: 500, // Only cache 500px worth of items
                       itemBuilder: (context, index) {
                         final item = visibleItems[index];
+                        // Use stable key based on URI to prevent widget recreation
                         return _LazyStatusItemCard(
+                          key: ValueKey('${item.uri}_${item.lastModified}'),
                           item: item,
                           onDownload: () => _downloadStatus(item),
                           onTap: () => _openPreview(item),
@@ -556,6 +621,16 @@ class FolderInstructionScreen extends StatelessWidget {
                             height: 1.35,
                           ),
                     ),
+                    const SizedBox(height: 10),
+                    Text(
+                      'Status Saver only reads photos and videos inside the WhatsApp .Statuses folder. '
+                      'No other chats, media or WhatsApp data are accessed or modified.',
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                            color: textColor,
+                            fontWeight: FontWeight.w600,
+                            height: 1.35,
+                          ),
+                    ),
                   ],
                 ),
               ),
@@ -568,7 +643,9 @@ class FolderInstructionScreen extends StatelessWidget {
               ),
               const SizedBox(height: 6),
               Text(
-                'Status Saver does not modify WhatsApp data. It only reads the selected folder to show previews and save copies to your gallery when you tap Download.',
+                'If you see a system message like “Can’t use this folder” or a suggestion to “Create new folder”, '
+                'ignore it and keep going deeper until you reach the .Statuses folder. '
+                'Creating a new folder will not show any statuses to download.',
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
                       color: mutedColor,
                       height: 1.35,
@@ -667,6 +744,7 @@ class _LazyStatusItemCard extends StatefulWidget {
   final VoidCallback? onTap;
 
   const _LazyStatusItemCard({
+    super.key,
     required this.item,
     required this.onDownload,
     this.onTap,
@@ -683,9 +761,13 @@ class _LazyStatusItemCardState extends State<_LazyStatusItemCard> {
   @override
   void initState() {
     super.initState();
-    // Check visibility after first frame
+    // Check visibility immediately and after first frame
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _checkVisibility();
+      // Also check after a short delay to catch items that become visible during scroll
+      Future.delayed(const Duration(milliseconds: 100), () {
+        if (mounted) _checkVisibility();
+      });
     });
   }
 
@@ -697,9 +779,9 @@ class _LazyStatusItemCardState extends State<_LazyStatusItemCard> {
       final size = renderObject.size;
       final screenHeight = MediaQuery.of(context).size.height;
       
-      // Consider visible if within viewport + 200px buffer
-      final isVisible = position.dy + size.height >= -200 && 
-                       position.dy <= screenHeight + 200;
+      // Consider visible if within viewport + 500px buffer (larger buffer for better detection)
+      final isVisible = position.dy + size.height >= -500 && 
+                       position.dy <= screenHeight + 500;
       
       if (isVisible && !_isVisible) {
         setState(() {
@@ -750,13 +832,36 @@ class StatusItemCard extends StatefulWidget {
   State<StatusItemCard> createState() => _StatusItemCardState();
 }
 
+// Static cache for synchronous cache checks during build
+class _ThumbnailCacheSync {
+  static final Map<String, String?> _cache = {};
+  
+  static String? get(String uri, int lastModified) {
+    final key = '$uri|$lastModified';
+    return _cache[key];
+  }
+  
+  static void set(String uri, int lastModified, String? path) {
+    final key = '$uri|$lastModified';
+    if (path != null) {
+      _cache[key] = path;
+    } else {
+      _cache.remove(key);
+    }
+  }
+  
+  static void clear() {
+    // Don't clear on refresh - cache persists
+  }
+}
+
 // Global throttling to limit concurrent thumbnail loads
 // Very strict limits to prevent GPU/memory overload
 class _ThumbnailLoader {
   static int _activeImageLoads = 0;
   static int _activeVideoLoads = 0;
-  static const int _maxConcurrentImageLoads = 3; // Reduced from 8 - prevent overload
-  static const int _maxConcurrentVideoLoads = 1; // Only 1 video at a time - very strict
+  static const int _maxConcurrentImageLoads = 3;
+  static const int _maxConcurrentVideoLoads = 2; // Limit concurrent video requests from Flutter
   static final List<Completer<void>> _waitingImages = [];
   static final List<Completer<void>> _waitingVideos = [];
 
@@ -806,12 +911,62 @@ class _StatusItemCardState extends State<StatusItemCard> {
   bool _isLoadingStarted = false;
   bool _isVisible = false;
   bool _isCancelled = false;
+  bool _cacheChecked = false;
+  bool _buildCallbackScheduled = false;
+  late final String _videoThumbRequestId = UniqueKey().toString();
 
   @override
   void initState() {
     super.initState();
-    // Don't load thumbnails immediately - wait for visibility
-    // This prevents loading hundreds of thumbnails at once
+    // Check static cache synchronously first (instant) for both images and videos
+    if (widget.item.isVideo) {
+      final cachedPath = _ThumbnailCacheSync.get(widget.item.uri, widget.item.lastModified);
+      if (cachedPath != null) {
+        _videoThumbnailPath = cachedPath;
+        _isLoadingThumbnail = false;
+        _cacheChecked = true;
+      } else {
+        // Static cache miss - set cacheChecked immediately so visibility can trigger loading
+        _isLoadingThumbnail = false;
+        _cacheChecked = true;
+        // Check disk cache async (fast file existence check)
+        _checkCacheSync();
+      }
+    } else {
+      // For images, check static cache synchronously
+      // Images are loaded from bytes, but we can check if already loaded
+      _isLoadingThumbnail = false;
+      _cacheChecked = true;
+    }
+  }
+
+  // Fast async cache check - populates static cache for future builds
+  Future<void> _checkCacheSync() async {
+    try {
+      final String? cachedPath = await _platform.invokeMethod<String>(
+        'checkVideoThumbnailCache',
+        <String, dynamic>{
+          'uri': widget.item.uri,
+          'lastModified': widget.item.lastModified,
+        },
+      );
+      
+      // Update static cache for synchronous access in future builds
+      _ThumbnailCacheSync.set(widget.item.uri, widget.item.lastModified, cachedPath);
+      
+      if (mounted && cachedPath != null) {
+        setState(() {
+          _videoThumbnailPath = cachedPath;
+          _isLoadingThumbnail = false;
+        });
+        return;
+      }
+    } catch (e) {
+      // Cache check failed, proceed with placeholder
+    }
+    
+    // Cache miss - don't trigger here, let didUpdateWidget handle it when visible
+    // This prevents race conditions with visibility detection
   }
 
   @override
@@ -828,26 +983,51 @@ class _StatusItemCardState extends State<StatusItemCard> {
   void _startLoading() {
     if (_isLoadingStarted || _isCancelled) return;
     
+    // Only trigger generation if cache miss (thumbnail not loaded yet)
+    final bool needsGeneration = widget.item.isVideo 
+        ? (_videoThumbnailPath == null)
+        : (_imageBytes == null);
+    
+    if (!needsGeneration) return;
+    
+    // Mark as started immediately to prevent duplicate calls
+    _isLoadingStarted = true;
+    
     // Delay loading to prioritize UI rendering
-    // Videos get much longer delay to prevent overload
+    // Videos get longer delay to prevent overload
     final delay = widget.item.isVideo 
-        ? const Duration(milliseconds: 800) // Videos: wait 800ms after visible
-        : const Duration(milliseconds: 150); // Images: wait 150ms after visible
+        ? const Duration(milliseconds: 200) // Videos: wait 200ms after visible
+        : const Duration(milliseconds: 50); // Images: wait 50ms after visible
     
     Future.delayed(delay, () {
-      if (mounted && !_isCancelled && !_isLoadingStarted && widget.isVisible) {
+      if (mounted && !_isCancelled && widget.isVisible) {
         _loadThumbnail();
+      } else {
+        // Reset if cancelled or not visible
+        _isLoadingStarted = false;
       }
     });
   }
 
   void _cancelLoading() {
     _isCancelled = true;
+    _isLoadingStarted = false; // Reset so it can be triggered again when visible
+    if (widget.item.isVideo) {
+      // Cancel any in-flight Android thumbnail request when item goes off-screen
+      _platform.invokeMethod('cancelVideoThumbnail', <String, dynamic>{
+        'requestId': _videoThumbRequestId,
+      }).catchError((_) {});
+    }
   }
 
   @override
   void dispose() {
     _isCancelled = true;
+    if (widget.item.isVideo) {
+      _platform.invokeMethod('cancelVideoThumbnail', <String, dynamic>{
+        'requestId': _videoThumbRequestId,
+      }).catchError((_) {});
+    }
     super.dispose();
   }
 
@@ -917,69 +1097,31 @@ class _StatusItemCardState extends State<StatusItemCard> {
   }
 
   Future<void> _loadVideoThumbnail() async {
-    // Acquire lock to limit concurrent loads (videos are heavy - only 2 at a time)
+    // Only generate if cache miss (thumbnail not already loaded)
+    if (_videoThumbnailPath != null) return;
+    
+    // Acquire lock to limit concurrent requests (Android also limits decode to 2 threads)
     await _ThumbnailLoader.acquire(isVideo: true);
     try {
-      if (!mounted) return;
+      if (_isCancelled || !mounted) return;
 
-      setState(() {
-        _isLoadingThumbnail = true;
-        _hasError = false;
-      });
-
-      // Try to generate thumbnail directly from URI first (much faster)
-      // This avoids reading entire video file into memory
-      try {
-        final tempDir = await getTemporaryDirectory();
-        final thumbnailPath = await VideoThumbnail.thumbnailFile(
-          video: widget.item.uri, // Use URI directly if supported
-          thumbnailPath: tempDir.path,
-          imageFormat: ImageFormat.JPEG,
-          maxWidth: 300, // Reduced from 400 for faster generation
-          quality: 60, // Reduced from 75 for faster generation
-          timeMs: 100, // Get thumbnail from first 100ms (very fast)
-        );
-
-        if (thumbnailPath != null && mounted) {
-          setState(() {
-            _videoThumbnailPath = thumbnailPath;
-            _isLoadingThumbnail = false;
-            _hasError = false;
-          });
-          return;
-        }
-      } catch (e) {
-        // If direct URI fails, fall back to reading bytes
-        // This happens if VideoThumbnail doesn't support content URIs
-      }
-
-      // Fallback: Read video bytes and generate thumbnail
-      // This is slower but works for all cases
-      final Uint8List? bytes = await _platform.invokeMethod<Uint8List>(
-        'readFileBytes',
-        <String, dynamic>{'uri': widget.item.uri},
+      // Video thumbnail generation must NOT run on Flutter UI thread.
+      // Delegate to Android: background ExecutorService (fixed pool) + disk cache + cancellation.
+      final String? thumbnailPath = await _platform.invokeMethod<String>(
+        'getVideoThumbnail',
+        <String, dynamic>{
+          'requestId': _videoThumbRequestId,
+          'uri': widget.item.uri,
+          'lastModified': widget.item.lastModified,
+        },
       );
 
-      if (bytes == null || !mounted) {
-        if (mounted) {
-          setState(() {
-            _isLoadingThumbnail = false;
-            _hasError = true;
-          });
-        }
-        return;
-      }
+      if (_isCancelled || !mounted) return;
 
-      // Generate thumbnail in isolate to avoid blocking main thread
-      final String? thumbnailPath = await compute(
-        _generateVideoThumbnail,
-        _VideoThumbnailParams(
-          bytes: bytes,
-          fileName: widget.item.name,
-        ),
-      );
-
-      if (mounted) {
+      if (mounted && !_isCancelled) {
+        // Update static cache for future synchronous access
+        _ThumbnailCacheSync.set(widget.item.uri, widget.item.lastModified, thumbnailPath);
+        
         setState(() {
           _videoThumbnailPath = thumbnailPath;
           _isLoadingThumbnail = false;
@@ -987,7 +1129,7 @@ class _StatusItemCardState extends State<StatusItemCard> {
         });
       }
     } catch (e) {
-      if (mounted) {
+      if (mounted && !_isCancelled) {
         setState(() {
           _isLoadingThumbnail = false;
           _hasError = true;
@@ -1002,6 +1144,38 @@ class _StatusItemCardState extends State<StatusItemCard> {
   Widget build(BuildContext context) {
     final isVideo = widget.item.isVideo;
     final sizeInMB = (widget.item.size / (1024 * 1024)).toStringAsFixed(2);
+    
+    // Check cache and trigger loading if needed (only once per build cycle)
+    if (!_buildCallbackScheduled) {
+      _buildCallbackScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _buildCallbackScheduled = false;
+        if (!mounted) return;
+        
+        // For videos: check static cache synchronously
+        if (isVideo && _videoThumbnailPath == null && _cacheChecked) {
+          final cachedPath = _ThumbnailCacheSync.get(widget.item.uri, widget.item.lastModified);
+          if (cachedPath != null && mounted) {
+            setState(() {
+              _videoThumbnailPath = cachedPath;
+              _isLoadingThumbnail = false;
+            });
+            return;
+          }
+        }
+        
+        // If visible and cache miss, trigger loading immediately
+        if (widget.isVisible && !_isLoadingStarted && !_isCancelled) {
+          final bool needsGeneration = isVideo 
+              ? (_videoThumbnailPath == null)
+              : (_imageBytes == null);
+          
+          if (needsGeneration) {
+            _startLoading();
+          }
+        }
+      });
+    }
 
     return Card(
       clipBehavior: Clip.antiAlias,
@@ -1014,14 +1188,7 @@ class _StatusItemCardState extends State<StatusItemCard> {
               child: Stack(
                 fit: StackFit.expand,
                 children: [
-                  if (_isLoadingThumbnail)
-                    Container(
-                      color: Theme.of(context).colorScheme.surfaceVariant,
-                      child: const Center(
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      ),
-                    )
-                  else if (_hasError)
+                  if (_hasError)
                     Container(
                       color: Theme.of(context).colorScheme.surfaceVariant,
                       child: Icon(
@@ -1059,6 +1226,7 @@ class _StatusItemCardState extends State<StatusItemCard> {
                       },
                     )
                   else
+                    // Placeholder only shown on cache miss (for videos) or before image load
                     Container(
                       color: Theme.of(context).colorScheme.surfaceVariant,
                       child: Icon(
@@ -1590,46 +1758,6 @@ class _StatusPreviewPageState extends State<StatusPreviewPage> {
 }
 
 // Helper functions to run in isolates (off main thread)
-
-/// Parameters for video thumbnail generation
-class _VideoThumbnailParams {
-  final Uint8List bytes;
-  final String fileName;
-
-  _VideoThumbnailParams({
-    required this.bytes,
-    required this.fileName,
-  });
-}
-
-/// Generate video thumbnail in isolate to avoid blocking main thread
-Future<String?> _generateVideoThumbnail(_VideoThumbnailParams params) async {
-  try {
-    // Get temp directory
-    final tempDir = await getTemporaryDirectory();
-    final tempVideoFile = File('${tempDir.path}/thumb_${params.fileName}');
-    
-    // Write bytes to temp file
-    await tempVideoFile.writeAsBytes(params.bytes);
-
-    // Generate thumbnail with optimized settings for speed
-    final thumbnailPath = await VideoThumbnail.thumbnailFile(
-      video: tempVideoFile.path,
-      thumbnailPath: tempDir.path,
-      imageFormat: ImageFormat.JPEG,
-      maxWidth: 250, // Further reduced for speed
-      quality: 50, // Further reduced for speed
-      timeMs: 50, // Get thumbnail from first 50ms (very fast)
-    );
-
-    // Clean up temp video file
-    tempVideoFile.delete().catchError((_) {});
-
-    return thumbnailPath;
-  } catch (e) {
-    return null;
-  }
-}
 
 /// Parse status items in isolate to avoid blocking main thread
 List<StatusItem> _parseStatusItems(List<dynamic> result) {

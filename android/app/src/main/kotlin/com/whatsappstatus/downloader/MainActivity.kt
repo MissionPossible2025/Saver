@@ -4,6 +4,8 @@ import android.content.ContentValues
 import android.content.Intent
 import android.content.SharedPreferences
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.DocumentsContract
@@ -26,6 +28,7 @@ class MainActivity: FlutterActivity() {
     private val REQUEST_CODE_FOLDER_ACCESS = 1001
     
     private var folderAccessResult: MethodChannel.Result? = null
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
     
     private val prefs: SharedPreferences by lazy {
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
@@ -60,6 +63,51 @@ class MainActivity: FlutterActivity() {
                         Log.e(TAG, "Error getting status items", e)
                         result.error("ERROR", "Failed to get status items: ${e.message}", null)
                     }
+                }
+                "notifyRefresh" -> {
+                    // Defer thumbnail work for 300ms after refresh to keep UI smooth.
+                    VideoThumbnailManager.notifyRefresh()
+                    result.success(true)
+                }
+                "getVideoThumbnail" -> {
+                    val requestId = call.argument<String>("requestId") ?: ""
+                    val uriString = call.argument<String>("uri") ?: ""
+                    val lastModified = call.argument<Long>("lastModified") ?: 0L
+                    if (requestId.isBlank() || uriString.isBlank()) {
+                        result.success(null)
+                        return@setMethodCallHandler
+                    }
+
+                    // IMPORTANT: Do not do any IO/bitmap decoding here (main thread).
+                    // All work is done in VideoThumbnailManager's executor (background threads).
+                    VideoThumbnailManager.getOrCreateThumbnailAsync(
+                        context = applicationContext,
+                        requestId = requestId,
+                        uriString = uriString,
+                        lastModified = lastModified,
+                        onResult = { path ->
+                            // Ensure we respond on main thread
+                            mainHandler.post { result.success(path) }
+                        }
+                    )
+                }
+                "cancelVideoThumbnail" -> {
+                    val requestId = call.argument<String>("requestId") ?: ""
+                    if (requestId.isNotBlank()) {
+                        VideoThumbnailManager.cancel(requestId)
+                    }
+                    result.success(true)
+                }
+                "checkVideoThumbnailCache" -> {
+                    // Synchronous cache check for UI build - fast file existence check
+                    val uriString = call.argument<String>("uri") ?: ""
+                    val lastModified = call.argument<Long>("lastModified") ?: 0L
+                    val cachedPath = VideoThumbnailManager.checkCacheSync(
+                        applicationContext,
+                        uriString,
+                        lastModified
+                    )
+                    result.success(cachedPath)
                 }
                 "downloadStatus" -> {
                     try {

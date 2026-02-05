@@ -7,15 +7,33 @@ import androidx.documentfile.provider.DocumentFile
 
 object StatusAccessHelper {
     private const val TAG = "StatusAccessHelper"
+    private const val WRONG_FOLDER_MESSAGE_PREFIX =
+        "SELECT_WHATSAPP_STATUSES_FOLDER: Selected folder does not contain the WhatsApp .Statuses folder."
 
     fun getStatusFiles(context: Context, treeUri: Uri): List<StatusFileInfo> {
         val statusFiles = mutableListOf<StatusFileInfo>()
 
         try {
             val root = DocumentFile.fromTreeUri(context, treeUri)
-                ?: return emptyList()
+                ?: throw IllegalStateException(WRONG_FOLDER_MESSAGE_PREFIX)
 
-            root.listFiles().forEach { docFile ->
+            // If user picked the .Statuses folder directly, use it.
+            val statusesDir: DocumentFile? = when {
+                root.isDirectory && (root.name == ".Statuses") -> root
+                else -> {
+                    // If user picked a parent (e.g. Media or WhatsApp), try to find .Statuses under it.
+                    root.listFiles().firstOrNull { dir ->
+                        dir.isDirectory && dir.name == ".Statuses"
+                    }
+                }
+            }
+
+            if (statusesDir == null) {
+                // This folder cannot lead to .Statuses – signal this explicitly.
+                throw IllegalStateException(WRONG_FOLDER_MESSAGE_PREFIX)
+            }
+
+            statusesDir.listFiles().forEach { docFile ->
                 if (docFile.isFile && isValidStatusFile(docFile)) {
                     val name = docFile.name ?: "status"
                     val mimeType = docFile.type ?: getMimeTypeFromName(name)
@@ -32,8 +50,13 @@ object StatusAccessHelper {
             }
         } catch (e: SecurityException) {
             Log.e(TAG, "Security exception accessing status folder", e)
+            throw e
+        } catch (e: IllegalStateException) {
+            Log.e(TAG, "Invalid status folder selection", e)
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Error accessing status folder", e)
+            throw e
         }
 
         // Sort by last modified (newest first)
