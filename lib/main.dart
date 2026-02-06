@@ -525,13 +525,15 @@ class _StatusDownloaderScreenState extends State<StatusDownloaderScreen> {
                         childAspectRatio: 0.75,
                       ),
                       itemCount: visibleItems.length,
-                      // Use cacheExtent to limit off-screen items
-                      cacheExtent: 500, // Only cache 500px worth of items
+                      // Increase cacheExtent to keep more items alive for smooth scrolling
+                      // This works with AutomaticKeepAliveClientMixin to persist loaded thumbnails
+                      cacheExtent: 1000, // Cache 1000px worth of items (more for better UX)
                       itemBuilder: (context, index) {
                         final item = visibleItems[index];
-                        // Use stable key based on URI to prevent widget recreation
+                        // Use stable key based on URI + lastModified to prevent widget recreation
+                        // This ensures widgets persist across tab switches and refreshes
                         return _LazyStatusItemCard(
-                          key: ValueKey('${item.uri}_${item.lastModified}'),
+                          key: ValueKey('${isImagesTab ? 'img' : 'vid'}_${item.uri}_${item.lastModified}'),
                           item: item,
                           onDownload: () => _downloadStatus(item),
                           onTap: () => _openPreview(item),
@@ -737,7 +739,7 @@ class StatusItem {
   bool get isVideo => mimeType.startsWith('video/');
 }
 
-// Wrapper widget that handles visibility detection
+// Wrapper widget that handles visibility detection using viewport intersection
 class _LazyStatusItemCard extends StatefulWidget {
   final StatusItem item;
   final VoidCallback onDownload;
@@ -757,17 +759,17 @@ class _LazyStatusItemCard extends StatefulWidget {
 class _LazyStatusItemCardState extends State<_LazyStatusItemCard> {
   final GlobalKey _key = GlobalKey();
   bool _isVisible = false;
+  bool _hasCheckedInitialVisibility = false;
 
   @override
   void initState() {
     super.initState();
-    // Check visibility immediately and after first frame
+    // Check visibility after first frame
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _checkVisibility();
-      // Also check after a short delay to catch items that become visible during scroll
-      Future.delayed(const Duration(milliseconds: 100), () {
-        if (mounted) _checkVisibility();
-      });
+      if (mounted) {
+        _checkVisibility();
+        _hasCheckedInitialVisibility = true;
+      }
     });
   }
 
@@ -775,21 +777,23 @@ class _LazyStatusItemCardState extends State<_LazyStatusItemCard> {
     if (!mounted) return;
     final RenderObject? renderObject = _key.currentContext?.findRenderObject();
     if (renderObject is RenderBox) {
-      final position = renderObject.localToGlobal(Offset.zero);
-      final size = renderObject.size;
+      final RenderBox box = renderObject;
+      final position = box.localToGlobal(Offset.zero);
+      final size = box.size;
       final screenHeight = MediaQuery.of(context).size.height;
+      final screenWidth = MediaQuery.of(context).size.width;
       
-      // Consider visible if within viewport + 500px buffer (larger buffer for better detection)
-      final isVisible = position.dy + size.height >= -500 && 
-                       position.dy <= screenHeight + 500;
+      // Consider visible if within viewport + buffer for preloading
+      // Buffer of 200px above and below viewport for smooth scrolling
+      final buffer = 200.0;
+      final isVisible = position.dy + size.height >= -buffer && 
+                       position.dy <= screenHeight + buffer &&
+                       position.dx + size.width >= -buffer &&
+                       position.dx <= screenWidth + buffer;
       
-      if (isVisible && !_isVisible) {
+      if (isVisible != _isVisible) {
         setState(() {
-          _isVisible = true;
-        });
-      } else if (!isVisible && _isVisible) {
-        setState(() {
-          _isVisible = false;
+          _isVisible = isVisible;
         });
       }
     }
@@ -797,10 +801,13 @@ class _LazyStatusItemCardState extends State<_LazyStatusItemCard> {
 
   @override
   Widget build(BuildContext context) {
-    // Use NotificationListener to detect scroll
+    // Use NotificationListener to detect scroll and update visibility
     return NotificationListener<ScrollNotification>(
-      onNotification: (_) {
-        _checkVisibility();
+      onNotification: (notification) {
+        if (notification is ScrollUpdateNotification || 
+            notification is ScrollEndNotification) {
+          _checkVisibility();
+        }
         return false;
       },
       child: StatusItemCard(
@@ -832,26 +839,44 @@ class StatusItemCard extends StatefulWidget {
   State<StatusItemCard> createState() => _StatusItemCardState();
 }
 
-// Static cache for synchronous cache checks during build
+// Persistent cache for thumbnails - stores both image bytes and video thumbnail paths
+// This cache persists across tab switches and scrolling
 class _ThumbnailCacheSync {
-  static final Map<String, String?> _cache = {};
+  // Cache for video thumbnail file paths
+  static final Map<String, String?> _videoCache = {};
+  // Cache for image bytes (in-memory)
+  static final Map<String, Uint8List?> _imageCache = {};
   
-  static String? get(String uri, int lastModified) {
+  static String? getVideoThumbnail(String uri, int lastModified) {
     final key = '$uri|$lastModified';
-    return _cache[key];
+    return _videoCache[key];
   }
   
-  static void set(String uri, int lastModified, String? path) {
+  static void setVideoThumbnail(String uri, int lastModified, String? path) {
     final key = '$uri|$lastModified';
     if (path != null) {
-      _cache[key] = path;
+      _videoCache[key] = path;
     } else {
-      _cache.remove(key);
+      _videoCache.remove(key);
+    }
+  }
+  
+  static Uint8List? getImageBytes(String uri, int lastModified) {
+    final key = '$uri|$lastModified';
+    return _imageCache[key];
+  }
+  
+  static void setImageBytes(String uri, int lastModified, Uint8List? bytes) {
+    final key = '$uri|$lastModified';
+    if (bytes != null) {
+      _imageCache[key] = bytes;
+    } else {
+      _imageCache.remove(key);
     }
   }
   
   static void clear() {
-    // Don't clear on refresh - cache persists
+    // Don't clear on refresh - cache persists until app exit
   }
 }
 
@@ -902,46 +927,74 @@ class _ThumbnailLoader {
   }
 }
 
-class _StatusItemCardState extends State<StatusItemCard> {
+// Mixin to keep widgets alive once loaded - prevents reloading when scrolling back
+class _StatusItemCardState extends State<StatusItemCard> with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => _thumbnailLoaded; // Keep alive once thumbnail is loaded
+  
+  bool _thumbnailLoaded = false;
+  
+  void _markThumbnailLoaded() {
+    if (!_thumbnailLoaded) {
+      _thumbnailLoaded = true;
+      updateKeepAlive(); // Notify framework to keep this widget alive
+    }
+  }
+
   static const _platform = MethodChannel('com.whatsappstatus.downloader/channel');
   Uint8List? _imageBytes;
   String? _videoThumbnailPath;
-  bool _isLoadingThumbnail = true;
+  bool _isLoadingThumbnail = false; // Start with false - show placeholder initially
   bool _hasError = false;
   bool _isLoadingStarted = false;
-  bool _isVisible = false;
   bool _isCancelled = false;
   bool _cacheChecked = false;
-  bool _buildCallbackScheduled = false;
   late final String _videoThumbRequestId = UniqueKey().toString();
 
   @override
   void initState() {
     super.initState();
-    // Check static cache synchronously first (instant) for both images and videos
+    _checkCache();
+  }
+
+  // Check both in-memory cache and disk cache synchronously
+  void _checkCache() {
     if (widget.item.isVideo) {
-      final cachedPath = _ThumbnailCacheSync.get(widget.item.uri, widget.item.lastModified);
+      // Check in-memory cache first (instant)
+      final cachedPath = _ThumbnailCacheSync.getVideoThumbnail(
+        widget.item.uri, 
+        widget.item.lastModified
+      );
       if (cachedPath != null) {
         _videoThumbnailPath = cachedPath;
         _isLoadingThumbnail = false;
         _cacheChecked = true;
-      } else {
-        // Static cache miss - set cacheChecked immediately so visibility can trigger loading
+        _markThumbnailLoaded(); // Mark as loaded so widget stays alive
+        return;
+      }
+      
+      // Check disk cache async (fast file existence check)
+      _cacheChecked = true;
+      _checkDiskCache();
+    } else {
+      // For images, check in-memory cache synchronously
+      final cachedBytes = _ThumbnailCacheSync.getImageBytes(
+        widget.item.uri, 
+        widget.item.lastModified
+      );
+      if (cachedBytes != null) {
+        _imageBytes = cachedBytes;
         _isLoadingThumbnail = false;
         _cacheChecked = true;
-        // Check disk cache async (fast file existence check)
-        _checkCacheSync();
+        _markThumbnailLoaded(); // Mark as loaded so widget stays alive
+        return;
       }
-    } else {
-      // For images, check static cache synchronously
-      // Images are loaded from bytes, but we can check if already loaded
-      _isLoadingThumbnail = false;
       _cacheChecked = true;
     }
   }
 
-  // Fast async cache check - populates static cache for future builds
-  Future<void> _checkCacheSync() async {
+  // Fast async cache check for video thumbnails - populates static cache for future builds
+  Future<void> _checkDiskCache() async {
     try {
       final String? cachedPath = await _platform.invokeMethod<String>(
         'checkVideoThumbnailCache',
@@ -952,55 +1005,64 @@ class _StatusItemCardState extends State<StatusItemCard> {
       );
       
       // Update static cache for synchronous access in future builds
-      _ThumbnailCacheSync.set(widget.item.uri, widget.item.lastModified, cachedPath);
-      
-      if (mounted && cachedPath != null) {
-        setState(() {
-          _videoThumbnailPath = cachedPath;
-          _isLoadingThumbnail = false;
-        });
-        return;
+      if (cachedPath != null) {
+        _ThumbnailCacheSync.setVideoThumbnail(
+          widget.item.uri, 
+          widget.item.lastModified, 
+          cachedPath
+        );
+        
+        if (mounted && !_isCancelled) {
+          setState(() {
+            _videoThumbnailPath = cachedPath;
+            _isLoadingThumbnail = false;
+          });
+          _markThumbnailLoaded();
+          return;
+        }
       }
     } catch (e) {
       // Cache check failed, proceed with placeholder
     }
     
-    // Cache miss - don't trigger here, let didUpdateWidget handle it when visible
-    // This prevents race conditions with visibility detection
+    // Cache miss - don't trigger loading here, let didUpdateWidget handle it when visible
   }
 
   @override
   void didUpdateWidget(StatusItemCard oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // When visibility changes, start or cancel loading
-    if (widget.isVisible && !oldWidget.isVisible && !_isLoadingStarted) {
-      _startLoading();
-    } else if (!widget.isVisible && oldWidget.isVisible) {
-      _cancelLoading();
+    // When visibility changes, start loading if visible and not already loaded
+    if (widget.isVisible && !oldWidget.isVisible) {
+      _startLoadingIfNeeded();
     }
+    // Don't cancel when going off-screen - keep thumbnails loaded for smooth scrolling
   }
 
-  void _startLoading() {
+  void _startLoadingIfNeeded() {
+    // Don't start if already loading, cancelled, or already loaded
     if (_isLoadingStarted || _isCancelled) return;
     
-    // Only trigger generation if cache miss (thumbnail not loaded yet)
-    final bool needsGeneration = widget.item.isVideo 
-        ? (_videoThumbnailPath == null)
-        : (_imageBytes == null);
+    // Check if thumbnail is already loaded (from cache or previous load)
+    final bool alreadyLoaded = widget.item.isVideo 
+        ? (_videoThumbnailPath != null)
+        : (_imageBytes != null);
     
-    if (!needsGeneration) return;
+    if (alreadyLoaded) {
+      _markThumbnailLoaded();
+      return; // Already have thumbnail, no need to load
+    }
     
     // Mark as started immediately to prevent duplicate calls
     _isLoadingStarted = true;
     
-    // Delay loading to prioritize UI rendering
-    // Videos get longer delay to prevent overload
+    // Small delay to batch loads and prioritize UI rendering
+    // Videos get slightly longer delay to prevent overload
     final delay = widget.item.isVideo 
-        ? const Duration(milliseconds: 200) // Videos: wait 200ms after visible
+        ? const Duration(milliseconds: 100) // Videos: wait 100ms after visible
         : const Duration(milliseconds: 50); // Images: wait 50ms after visible
     
     Future.delayed(delay, () {
-      if (mounted && !_isCancelled && widget.isVisible) {
+      if (mounted && !_isCancelled && widget.isVisible && _isLoadingStarted) {
         _loadThumbnail();
       } else {
         // Reset if cancelled or not visible
@@ -1009,21 +1071,11 @@ class _StatusItemCardState extends State<StatusItemCard> {
     });
   }
 
-  void _cancelLoading() {
-    _isCancelled = true;
-    _isLoadingStarted = false; // Reset so it can be triggered again when visible
-    if (widget.item.isVideo) {
-      // Cancel any in-flight Android thumbnail request when item goes off-screen
-      _platform.invokeMethod('cancelVideoThumbnail', <String, dynamic>{
-        'requestId': _videoThumbRequestId,
-      }).catchError((_) {});
-    }
-  }
-
   @override
   void dispose() {
     _isCancelled = true;
-    if (widget.item.isVideo) {
+    // Only cancel video thumbnail generation if not yet loaded
+    if (widget.item.isVideo && _videoThumbnailPath == null) {
       _platform.invokeMethod('cancelVideoThumbnail', <String, dynamic>{
         'requestId': _videoThumbRequestId,
       }).catchError((_) {});
@@ -1032,9 +1084,6 @@ class _StatusItemCardState extends State<StatusItemCard> {
   }
 
   Future<void> _loadThumbnail() async {
-    if (_isLoadingStarted) return;
-    _isLoadingStarted = true;
-
     if (widget.item.isVideo) {
       await _loadVideoThumbnail();
     } else {
@@ -1044,13 +1093,37 @@ class _StatusItemCardState extends State<StatusItemCard> {
 
   Future<void> _loadImageBytes() async {
     // Check if cancelled before starting
-    if (_isCancelled || !mounted) return;
+    if (_isCancelled || !mounted) {
+      _isLoadingStarted = false;
+      return;
+    }
+
+    // Check cache again (might have been loaded by another instance)
+    final cachedBytes = _ThumbnailCacheSync.getImageBytes(
+      widget.item.uri, 
+      widget.item.lastModified
+    );
+    if (cachedBytes != null) {
+      if (mounted && !_isCancelled) {
+        setState(() {
+          _imageBytes = cachedBytes;
+          _isLoadingThumbnail = false;
+          _hasError = false;
+        });
+        _markThumbnailLoaded();
+        _isLoadingStarted = false;
+      }
+      return;
+    }
 
     // Acquire lock to limit concurrent loads (images are fast)
     await _ThumbnailLoader.acquire(isVideo: false);
     try {
       // Check again after acquiring lock
-      if (_isCancelled || !mounted) return;
+      if (_isCancelled || !mounted) {
+        _isLoadingStarted = false;
+        return;
+      }
 
       setState(() {
         _isLoadingThumbnail = true;
@@ -1063,7 +1136,10 @@ class _StatusItemCardState extends State<StatusItemCard> {
         <String, dynamic>{'uri': widget.item.uri},
       );
 
-      if (_isCancelled || !mounted) return;
+      if (_isCancelled || !mounted) {
+        _isLoadingStarted = false;
+        return;
+      }
 
       if (bytes == null) {
         if (mounted && !_isCancelled) {
@@ -1072,17 +1148,25 @@ class _StatusItemCardState extends State<StatusItemCard> {
             _hasError = true;
           });
         }
+        _isLoadingStarted = false;
         return;
       }
 
+      // Cache the bytes for future use (persists across tab switches)
+      _ThumbnailCacheSync.setImageBytes(
+        widget.item.uri, 
+        widget.item.lastModified, 
+        bytes
+      );
+
       // Use original bytes - Image.memory handles async decoding efficiently
-      // Throttling prevents too many concurrent decodings
       if (mounted && !_isCancelled) {
         setState(() {
           _imageBytes = bytes;
           _isLoadingThumbnail = false;
           _hasError = false;
         });
+        _markThumbnailLoaded(); // Keep widget alive now that thumbnail is loaded
       }
     } catch (e) {
       if (mounted && !_isCancelled) {
@@ -1093,17 +1177,48 @@ class _StatusItemCardState extends State<StatusItemCard> {
       }
     } finally {
       _ThumbnailLoader.release(isVideo: false);
+      _isLoadingStarted = false;
     }
   }
 
   Future<void> _loadVideoThumbnail() async {
     // Only generate if cache miss (thumbnail not already loaded)
-    if (_videoThumbnailPath != null) return;
+    if (_videoThumbnailPath != null) {
+      _markThumbnailLoaded();
+      _isLoadingStarted = false;
+      return;
+    }
+    
+    // Check cache again (might have been loaded by another instance)
+    final cachedPath = _ThumbnailCacheSync.getVideoThumbnail(
+      widget.item.uri, 
+      widget.item.lastModified
+    );
+    if (cachedPath != null) {
+      if (mounted && !_isCancelled) {
+        setState(() {
+          _videoThumbnailPath = cachedPath;
+          _isLoadingThumbnail = false;
+          _hasError = false;
+        });
+        _markThumbnailLoaded();
+        _isLoadingStarted = false;
+      }
+      return;
+    }
     
     // Acquire lock to limit concurrent requests (Android also limits decode to 2 threads)
     await _ThumbnailLoader.acquire(isVideo: true);
     try {
-      if (_isCancelled || !mounted) return;
+      if (_isCancelled || !mounted) {
+        _isLoadingStarted = false;
+        return;
+      }
+
+      setState(() {
+        _isLoadingThumbnail = true;
+        _hasError = false;
+      });
 
       // Video thumbnail generation must NOT run on Flutter UI thread.
       // Delegate to Android: background ExecutorService (fixed pool) + disk cache + cancellation.
@@ -1116,17 +1231,27 @@ class _StatusItemCardState extends State<StatusItemCard> {
         },
       );
 
-      if (_isCancelled || !mounted) return;
+      if (_isCancelled || !mounted) {
+        _isLoadingStarted = false;
+        return;
+      }
 
       if (mounted && !_isCancelled) {
-        // Update static cache for future synchronous access
-        _ThumbnailCacheSync.set(widget.item.uri, widget.item.lastModified, thumbnailPath);
+        // Update static cache for future synchronous access (persists across tab switches)
+        if (thumbnailPath != null) {
+          _ThumbnailCacheSync.setVideoThumbnail(
+            widget.item.uri, 
+            widget.item.lastModified, 
+            thumbnailPath
+          );
+        }
         
         setState(() {
           _videoThumbnailPath = thumbnailPath;
           _isLoadingThumbnail = false;
           _hasError = thumbnailPath == null;
         });
+        _markThumbnailLoaded(); // Keep widget alive now that thumbnail is loaded
       }
     } catch (e) {
       if (mounted && !_isCancelled) {
@@ -1137,42 +1262,22 @@ class _StatusItemCardState extends State<StatusItemCard> {
       }
     } finally {
       _ThumbnailLoader.release(isVideo: true);
+      _isLoadingStarted = false;
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    super.build(context); // Required for AutomaticKeepAliveClientMixin
+    
     final isVideo = widget.item.isVideo;
     final sizeInMB = (widget.item.size / (1024 * 1024)).toStringAsFixed(2);
     
-    // Check cache and trigger loading if needed (only once per build cycle)
-    if (!_buildCallbackScheduled) {
-      _buildCallbackScheduled = true;
+    // Trigger loading if visible and not already loaded/loading
+    if (widget.isVisible && _cacheChecked && !_isLoadingStarted && !_isCancelled) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        _buildCallbackScheduled = false;
-        if (!mounted) return;
-        
-        // For videos: check static cache synchronously
-        if (isVideo && _videoThumbnailPath == null && _cacheChecked) {
-          final cachedPath = _ThumbnailCacheSync.get(widget.item.uri, widget.item.lastModified);
-          if (cachedPath != null && mounted) {
-            setState(() {
-              _videoThumbnailPath = cachedPath;
-              _isLoadingThumbnail = false;
-            });
-            return;
-          }
-        }
-        
-        // If visible and cache miss, trigger loading immediately
-        if (widget.isVisible && !_isLoadingStarted && !_isCancelled) {
-          final bool needsGeneration = isVideo 
-              ? (_videoThumbnailPath == null)
-              : (_imageBytes == null);
-          
-          if (needsGeneration) {
-            _startLoading();
-          }
+        if (mounted && widget.isVisible) {
+          _startLoadingIfNeeded();
         }
       });
     }
