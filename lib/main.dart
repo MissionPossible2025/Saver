@@ -70,6 +70,7 @@ class _StatusDownloaderScreenState extends State<StatusDownloaderScreen> {
   bool hasPermission = false;
   bool isCheckingPermission = true;
   int _selectedTabIndex = 0; // 0 = Images, 1 = Videos
+  final ValueNotifier<int> _scrollNotifier = ValueNotifier(0);
 
   @override
   void initState() {
@@ -515,30 +516,41 @@ class _StatusDownloaderScreenState extends State<StatusDownloaderScreen> {
                   ? _EmptyTabState(
                       isImagesTab: isImagesTab,
                     )
-                  : GridView.builder(
-                      padding: const EdgeInsets.all(16),
-                      gridDelegate:
-                          const SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: 2,
-                        crossAxisSpacing: 16,
-                        mainAxisSpacing: 16,
-                        childAspectRatio: 0.75,
-                      ),
-                      itemCount: visibleItems.length,
-                      // Increase cacheExtent to keep more items alive for smooth scrolling
-                      // This works with AutomaticKeepAliveClientMixin to persist loaded thumbnails
-                      cacheExtent: 1000, // Cache 1000px worth of items (more for better UX)
-                      itemBuilder: (context, index) {
-                        final item = visibleItems[index];
-                        // Use stable key based on URI + lastModified to prevent widget recreation
-                        // This ensures widgets persist across tab switches and refreshes
-                        return _LazyStatusItemCard(
-                          key: ValueKey('${isImagesTab ? 'img' : 'vid'}_${item.uri}_${item.lastModified}'),
-                          item: item,
-                          onDownload: () => _downloadStatus(item),
-                          onTap: () => _openPreview(item),
-                        );
+                  : NotificationListener<ScrollNotification>(
+                      // Must wrap GridView so we receive scroll notifications (they bubble up from scrollable)
+                      onNotification: (notification) {
+                        if (notification is ScrollUpdateNotification ||
+                            notification is ScrollEndNotification) {
+                          _scrollNotifier.value++;
+                        }
+                        return false;
                       },
+                      child: GridView.builder(
+                        padding: const EdgeInsets.all(16),
+                        gridDelegate:
+                            const SliverGridDelegateWithFixedCrossAxisCount(
+                          crossAxisCount: 2,
+                          crossAxisSpacing: 16,
+                          mainAxisSpacing: 16,
+                          childAspectRatio: 0.75,
+                        ),
+                        itemCount: visibleItems.length,
+                        // Increase cacheExtent to keep more items alive for smooth scrolling
+                        // This works with AutomaticKeepAliveClientMixin to persist loaded thumbnails
+                        cacheExtent: 1000, // Cache 1000px worth of items (more for better UX)
+                        itemBuilder: (context, index) {
+                          final item = visibleItems[index];
+                          // Use stable key based on URI + lastModified to prevent widget recreation
+                          // This ensures widgets persist across tab switches and refreshes
+                          return _LazyStatusItemCard(
+                            key: ValueKey('${isImagesTab ? 'img' : 'vid'}_${item.uri}_${item.lastModified}'),
+                            scrollNotifier: _scrollNotifier,
+                            item: item,
+                            onDownload: () => _downloadStatus(item),
+                            onTap: () => _openPreview(item),
+                          );
+                        },
+                      ),
                     ),
         ),
       ],
@@ -744,11 +756,13 @@ class _LazyStatusItemCard extends StatefulWidget {
   final StatusItem item;
   final VoidCallback onDownload;
   final VoidCallback? onTap;
+  final ValueNotifier<int> scrollNotifier;
 
   const _LazyStatusItemCard({
     super.key,
     required this.item,
     required this.onDownload,
+    required this.scrollNotifier,
     this.onTap,
   });
 
@@ -759,18 +773,25 @@ class _LazyStatusItemCard extends StatefulWidget {
 class _LazyStatusItemCardState extends State<_LazyStatusItemCard> {
   final GlobalKey _key = GlobalKey();
   bool _isVisible = false;
-  bool _hasCheckedInitialVisibility = false;
+
+  void _onScroll() {
+    if (mounted) _checkVisibility();
+  }
 
   @override
   void initState() {
     super.initState();
-    // Check visibility after first frame
+    widget.scrollNotifier.addListener(_onScroll);
+    // Check visibility after first frame (for items already in viewport)
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) {
-        _checkVisibility();
-        _hasCheckedInitialVisibility = true;
-      }
+      if (mounted) _checkVisibility();
     });
+  }
+
+  @override
+  void dispose() {
+    widget.scrollNotifier.removeListener(_onScroll);
+    super.dispose();
   }
 
   void _checkVisibility() {
@@ -801,22 +822,12 @@ class _LazyStatusItemCardState extends State<_LazyStatusItemCard> {
 
   @override
   Widget build(BuildContext context) {
-    // Use NotificationListener to detect scroll and update visibility
-    return NotificationListener<ScrollNotification>(
-      onNotification: (notification) {
-        if (notification is ScrollUpdateNotification || 
-            notification is ScrollEndNotification) {
-          _checkVisibility();
-        }
-        return false;
-      },
-      child: StatusItemCard(
-        key: _key,
-        item: widget.item,
-        onDownload: widget.onDownload,
-        onTap: widget.onTap,
-        isVisible: _isVisible,
-      ),
+    return StatusItemCard(
+      key: _key,
+      item: widget.item,
+      onDownload: widget.onDownload,
+      onTap: widget.onTap,
+      isVisible: _isVisible,
     );
   }
 }
@@ -1288,111 +1299,136 @@ class _StatusItemCardState extends State<StatusItemCard> with AutomaticKeepAlive
         onTap: widget.onTap,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisSize: MainAxisSize.min,
           children: [
             Expanded(
               child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  if (_hasError)
-                    Container(
-                      color: Theme.of(context).colorScheme.surfaceVariant,
-                      child: Icon(
-                        isVideo ? Icons.videocam : Icons.image,
-                        size: 48,
-                        color: Theme.of(context).colorScheme.onSurfaceVariant,
-                      ),
-                    )
-                  else if (!isVideo && _imageBytes != null)
-                    Image.memory(
-                      _imageBytes!,
-                      fit: BoxFit.cover,
-                      errorBuilder: (context, error, stackTrace) {
-                        return Container(
+                    fit: StackFit.expand,
+                    children: [
+                      if (_hasError)
+                        Container(
                           color: Theme.of(context).colorScheme.surfaceVariant,
-                          child: const Icon(
-                            Icons.image,
+                          child: Icon(
+                            isVideo ? Icons.videocam : Icons.image,
                             size: 48,
+                            color: Theme.of(context).colorScheme.onSurfaceVariant,
                           ),
-                        );
-                      },
-                    )
-                  else if (isVideo && _videoThumbnailPath != null)
-                    Image.file(
-                      File(_videoThumbnailPath!),
-                      fit: BoxFit.cover,
-                      errorBuilder: (context, error, stackTrace) {
-                        return Container(
+                        )
+                      else if (!isVideo && _imageBytes != null)
+                        Image.memory(
+                          _imageBytes!,
+                          fit: BoxFit.cover,
+                          errorBuilder: (context, error, stackTrace) {
+                            return Container(
+                              color: Theme.of(context).colorScheme.surfaceVariant,
+                              child: const Icon(
+                                Icons.image,
+                                size: 48,
+                              ),
+                            );
+                          },
+                        )
+                      else if (isVideo && _videoThumbnailPath != null)
+                        Image.file(
+                          File(_videoThumbnailPath!),
+                          fit: BoxFit.cover,
+                          errorBuilder: (context, error, stackTrace) {
+                            return Container(
+                              color: Theme.of(context).colorScheme.surfaceVariant,
+                              child: const Icon(
+                                Icons.videocam,
+                                size: 48,
+                              ),
+                            );
+                          },
+                        )
+                      else
+                        Container(
                           color: Theme.of(context).colorScheme.surfaceVariant,
-                          child: const Icon(
-                            Icons.videocam,
+                          child: Icon(
+                            isVideo ? Icons.videocam : Icons.image,
                             size: 48,
+                            color: Theme.of(context).colorScheme.onSurfaceVariant,
                           ),
-                        );
-                      },
-                    )
-                  else
-                    // Placeholder only shown on cache miss (for videos) or before image load
-                    Container(
-                      color: Theme.of(context).colorScheme.surfaceVariant,
-                      child: Icon(
-                        isVideo ? Icons.videocam : Icons.image,
-                        size: 48,
-                        color: Theme.of(context).colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                  if (isVideo)
-                    Positioned(
-                      top: 8,
-                      right: 8,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                          vertical: 4,
                         ),
-                        decoration: BoxDecoration(
-                          color: Colors.black54,
-                          borderRadius: BorderRadius.circular(4),
+                      if (isVideo)
+                        Positioned(
+                          top: 8,
+                          right: 8,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.black54,
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: const Icon(
+                              Icons.play_circle_outline,
+                              color: Colors.white,
+                              size: 20,
+                            ),
+                          ),
                         ),
-                        child: const Icon(
-                          Icons.play_circle_outline,
-                          color: Colors.white,
-                          size: 20,
-                        ),
-                      ),
-                    ),
-                ],
-              ),
+                    ],
+                  ),
             ),
-            Padding(
-              padding: const EdgeInsets.all(8.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    widget.item.name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    '$sizeInMB MB · ${isVideo ? 'Video' : 'Image'}',
-                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: Theme.of(context)
-                              .colorScheme
-                              .onSurfaceVariant,
+            Flexible(
+              fit: FlexFit.loose,
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final w = constraints.maxWidth.isFinite
+                      ? constraints.maxWidth
+                      : 200.0;
+                  return FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.topCenter,
+                    child: SizedBox(
+                      width: w,
+                      child: Padding(
+                        padding: const EdgeInsets.all(8.0),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Text(
+                              widget.item.name,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '$sizeInMB MB · ${isVideo ? 'Video' : 'Image'}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodySmall
+                                  ?.copyWith(
+                                    color: Theme.of(context)
+                                        .colorScheme
+                                        .onSurfaceVariant,
+                                  ),
+                            ),
+                            const SizedBox(height: 8),
+                            FilledButton.icon(
+                              onPressed: widget.onDownload,
+                              icon: const Icon(Icons.download, size: 18),
+                              label: const Text('Download'),
+                              style: FilledButton.styleFrom(
+                                padding:
+                                    const EdgeInsets.symmetric(horizontal: 12),
+                                minimumSize: const Size(0, 36),
+                              ),
+                            ),
+                          ],
                         ),
-                  ),
-                  const SizedBox(height: 8),
-                  FilledButton.icon(
-                    onPressed: widget.onDownload,
-                    icon: const Icon(Icons.download, size: 18),
-                    label: const Text('Download'),
-                    style: FilledButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      ),
                     ),
-                  ),
-                ],
+                  );
+                },
               ),
             ),
           ],
@@ -1718,29 +1754,29 @@ class _StatusPreviewPageState extends State<StatusPreviewPage> {
         _errorMessage = null;
       });
 
-      // Copy content URI to temp file for video_player
-      final Uint8List? bytes = await _platform.invokeMethod<Uint8List>(
-        'readFileBytes',
-        <String, dynamic>{'uri': widget.item.uri},
-      );
-
-      if (bytes == null) {
-        throw Exception('Failed to read video file');
-      }
-
-      final tempDir = await getTemporaryDirectory();
-      final tempFile = File('${tempDir.path}/${widget.item.name}');
-      await tempFile.writeAsBytes(bytes);
-
       if (mounted) {
-        _videoController = VideoPlayerController.file(tempFile);
+        // Use contentUri on Android - no copy needed, works directly with SAF
+        if (Platform.isAndroid) {
+          _videoController = VideoPlayerController.contentUri(Uri.parse(widget.item.uri));
+        } else {
+          // Fallback: copy to temp file for other platforms
+          final Uint8List? bytes = await _platform.invokeMethod<Uint8List>(
+            'readFileBytes',
+            <String, dynamic>{'uri': widget.item.uri},
+          );
+          if (bytes == null) throw Exception('Failed to read video file');
+          final tempDir = await getTemporaryDirectory();
+          final tempFile = File('${tempDir.path}/${widget.item.name}');
+          await tempFile.writeAsBytes(bytes);
+          _videoController = VideoPlayerController.file(tempFile);
+          _tempVideoFile = tempFile;
+        }
         await _videoController!.initialize();
-        
+
         if (mounted) {
           setState(() {
             _isVideoInitialized = true;
             _isVideoLoading = false;
-            _tempVideoFile = tempFile;
           });
           _videoController?.play();
         }
@@ -1771,90 +1807,130 @@ class _StatusPreviewPageState extends State<StatusPreviewPage> {
       appBar: AppBar(
         title: Text(isVideo ? 'Video preview' : 'Image preview'),
       ),
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: isVideo
-              ? _buildVideoPreview()
-              : _buildImagePreview(),
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          return SingleChildScrollView(
+            child: ConstrainedBox(
+              constraints: BoxConstraints(minHeight: constraints.maxHeight),
+              child: IntrinsicHeight(
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: isVideo
+                      ? _buildVideoPreview(constraints.maxHeight)
+                      : _buildImagePreview(constraints.maxHeight),
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildImagePreview(double maxHeight) {
+    if (_isImageLoading) {
+      return SizedBox(
+        height: maxHeight > 0 ? maxHeight - 32 : 200,
+        child: const Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    if (_errorMessage != null || _imageBytes == null) {
+      return SizedBox(
+        height: maxHeight > 0 ? maxHeight - 32 : 200,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.broken_image, size: 72),
+            const SizedBox(height: 12),
+            Text(_errorMessage ?? 'Unable to load image', textAlign: TextAlign.center),
+          ],
+        ),
+      );
+    }
+
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxHeight: maxHeight > 0 ? maxHeight - 32 : double.infinity),
+      child: InteractiveViewer(
+        child: Image.memory(
+          _imageBytes!,
+          fit: BoxFit.contain,
         ),
       ),
     );
   }
 
-  Widget _buildImagePreview() {
-    if (_isImageLoading) {
-      return const CircularProgressIndicator();
-    }
-
-    if (_errorMessage != null || _imageBytes == null) {
-      return Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          const Icon(Icons.broken_image, size: 72),
-          const SizedBox(height: 12),
-          Text(_errorMessage ?? 'Unable to load image'),
-        ],
-      );
-    }
-
-    return InteractiveViewer(
-      child: Image.memory(
-        _imageBytes!,
-        fit: BoxFit.contain,
-      ),
-    );
-  }
-
-  Widget _buildVideoPreview() {
+  Widget _buildVideoPreview(double maxHeight) {
     if (_isVideoLoading) {
-      return const Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          CircularProgressIndicator(),
-          SizedBox(height: 16),
-          Text('Loading video...'),
-        ],
+      return SizedBox(
+        height: maxHeight > 0 ? maxHeight - 32 : 200,
+        child: const Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(height: 16),
+            Text('Loading video...'),
+          ],
+        ),
       );
     }
 
     if (_errorMessage != null) {
-      return Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          const Icon(Icons.error_outline, size: 72),
-          const SizedBox(height: 12),
-          Text(_errorMessage!),
-        ],
+      return SizedBox(
+        height: maxHeight > 0 ? maxHeight - 32 : 200,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.error_outline, size: 72),
+            const SizedBox(height: 12),
+            Text(_errorMessage!, textAlign: TextAlign.center),
+          ],
+        ),
       );
     }
 
     if (!_isVideoInitialized || _videoController == null) {
-      return const CircularProgressIndicator();
+      return SizedBox(
+        height: maxHeight > 0 ? maxHeight - 32 : 200,
+        child: const Center(child: CircularProgressIndicator()),
+      );
     }
 
+    final controller = _videoController!;
+    final aspectRatio = controller.value.aspectRatio;
+    final safeAspectRatio = aspectRatio > 0 ? aspectRatio : 16 / 9;
+
+    // Video needs explicit non-zero size to render - Flexible can give zero height
+    final videoHeight = (maxHeight > 0 ? maxHeight - 80 : 400.0).toDouble();
+
     return Column(
-      mainAxisAlignment: MainAxisAlignment.center,
+      mainAxisSize: MainAxisSize.min,
       children: [
-        AspectRatio(
-          aspectRatio: _videoController!.value.aspectRatio,
-          child: VideoPlayer(_videoController!),
+        SizedBox(
+          height: videoHeight,
+          child: Center(
+            child: AspectRatio(
+              aspectRatio: safeAspectRatio,
+              child: VideoPlayer(controller),
+            ),
+          ),
         ),
         const SizedBox(height: 16),
         IconButton.filled(
           iconSize: 40,
           onPressed: () {
-            if (_videoController!.value.isPlaying) {
-              _videoController!.pause();
+            if (controller.value.isPlaying) {
+              controller.pause();
             } else {
-              _videoController!.play();
+              controller.play();
             }
             setState(() {});
           },
           icon: Icon(
-            _videoController!.value.isPlaying
-                ? Icons.pause
-                : Icons.play_arrow,
+            controller.value.isPlaying ? Icons.pause : Icons.play_arrow,
           ),
         ),
       ],
